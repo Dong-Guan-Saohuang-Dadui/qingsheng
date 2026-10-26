@@ -1,0 +1,15 @@
+*.exe
+*.pdb
+self-test.txt
+bin/
+obj/
+.vs/
+.env
+.env.*
+credentials*
+options.json
+hotkey.json
+*.wav
+*.pcm
+*.mp3
+*.log
