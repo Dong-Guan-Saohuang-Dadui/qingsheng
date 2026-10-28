@@ -13,10 +13,17 @@ using System.Threading.Tasks;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
 
+[assembly:System.Reflection.AssemblyTitle("轻声 QingSheng")]
+[assembly:System.Reflection.AssemblyProduct("轻声 QingSheng")]
+[assembly:System.Reflection.AssemblyVersion("0.2.0.0")]
+[assembly:System.Reflection.AssemblyFileVersion("0.2.0.0")]
+
 namespace XunfeiLite {
 static class Program {
  [STAThread] static void Main(string[] args) {
   if(args.Contains("--self-test")){ try{ SelfTest.Run(); }catch(Exception ex){File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"self-test.txt"),ex.GetType().FullName+" "+ex.Message+"\r\n"+ex.StackTrace);Environment.ExitCode=1;} return; }
+  if(args.Length==2&&args[0]=="--stream-test"){try{ContinuousTests.LiveFile(args[1]);}catch(Exception ex){File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"stream-test.txt"),ex.ToString());Environment.ExitCode=1;}return;}
+  if(args.Contains("--mic-test")){try{ContinuousTests.MicTest();}catch(Exception ex){File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"mic-test.txt"),ex.Message);Environment.ExitCode=1;}return;}
   bool fresh; using(var mutex=new Mutex(true,"Local\\XunfeiLite.Singleton",out fresh)) {
    if(!fresh)return; Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false); Application.Run(new Host());
   }
@@ -36,13 +43,15 @@ class HotkeyConfig {
  public void Save(){Directory.CreateDirectory(Path.GetDirectoryName(FileName));File.WriteAllText(FileName,new JavaScriptSerializer().Serialize(this));}
  public override string ToString(){return ((Modifiers&2)!=0?"Ctrl+":"")+((Modifiers&1)!=0?"Alt+":"")+((Modifiers&4)!=0?"Shift+":"")+((Keys)Key).ToString();}
 }
-class Session : IDisposable {
+class Session : IRecognitionPart {
  Credentials c;AppOptions options;Action<string> partial;ClientWebSocket ws=new ClientWebSocket();CancellationTokenSource cancel=new CancellationTokenSource();BlockingCollection<byte[]> queue=new BlockingCollection<byte[]>(200);Recorder recorder;Task sender;Task<string> receiver;
  public Session(Credentials c,AppOptions options,Action<string> partial){this.c=c;this.options=options;this.partial=partial;cancel.CancelAfter(TimeSpan.FromSeconds(75));}
  public static string Url(Credentials c,string date){const string host="iat-api.xfyun.cn";string source="host: "+host+"\ndate: "+date+"\nGET /v2/iat HTTP/1.1";string sig;using(var h=new HMACSHA256(Encoding.UTF8.GetBytes(c.ApiSecret)))sig=Convert.ToBase64String(h.ComputeHash(Encoding.UTF8.GetBytes(source)));string auth="api_key=\""+c.ApiKey+"\", algorithm=\"hmac-sha256\", headers=\"host date request-line\", signature=\""+sig+"\"";return "wss://"+host+"/v2/iat?authorization="+Uri.EscapeDataString(Convert.ToBase64String(Encoding.UTF8.GetBytes(auth)))+"&date="+Uri.EscapeDataString(date)+"&host="+host;}
  public Task<string> Completion {get{return receiver;}}
  public void StopCapture(){if(recorder!=null){recorder.Dispose();recorder=null;}if(!queue.IsAddingCompleted)queue.CompleteAdding();}
  public async Task Connect(){var connect=ws.ConnectAsync(new Uri(Url(c,DateTime.UtcNow.ToString("r"))),cancel.Token);if(await Task.WhenAny(connect,Task.Delay(10000))!=connect){cancel.Cancel();throw new Exception("连接超时，请检查网络。");}await connect;receiver=Receive();sender=Task.Run(()=>Send());}
+ public void PushAudio(byte[] bytes){if(queue.IsAddingCompleted||!queue.TryAdd(bytes))throw new Exception("网络发送积压，已停止录音以避免丢失音频。");}
+ public void Seal(){StopCapture();}
  public void Start(){recorder=new Recorder(bytes=>{if(!queue.TryAdd(bytes))cancel.Cancel();});recorder.Start();}
  async Task Send(){bool first=true;foreach(var bytes in queue.GetConsumingEnumerable(cancel.Token)){await Frame(first?0:1,bytes);first=false;}if(first)await Frame(0,new byte[0]);await Frame(2,new byte[0]);}
  async Task Frame(int status,byte[] bytes){var payload=new Dictionary<string,object>();if(status==0){payload["common"]=new{app_id=c.AppId};payload["business"]=options.Business();}payload["data"]=new{status=status,format="audio/L16;rate=16000",encoding="raw",audio=Convert.ToBase64String(bytes)};byte[] data=Encoding.UTF8.GetBytes(new JavaScriptSerializer().Serialize(payload));await ws.SendAsync(new ArraySegment<byte>(data),WebSocketMessageType.Text,true,cancel.Token);}
@@ -52,13 +61,23 @@ class Session : IDisposable {
  public void Cancel(){cancel.Cancel();ws.Abort();}
  public void Dispose(){if(recorder!=null){recorder.Dispose();recorder=null;}cancel.Cancel();ws.Dispose();}
 }
+class MicDevice {public int Id;public string Name;public MicDevice(int id,string name){Id=id;Name=name;}public override string ToString(){return Name;}}
 class Recorder : IDisposable {
+ public static void ApplyGain(byte[] bytes,int percent){if(percent==100)return;percent=Math.Max(0,Math.Min(400,percent));for(int i=0;i+1<bytes.Length;i+=2){int sample=(short)(bytes[i]|bytes[i+1]<<8);sample=Math.Max(short.MinValue,Math.Min(short.MaxValue,sample*percent/100));bytes[i]=(byte)(sample&255);bytes[i+1]=(byte)((sample>>8)&255);}}
  [StructLayout(LayoutKind.Sequential)] struct Format{public ushort tag,channels;public uint rate,bytes;public ushort align,bits,extra;}
  [StructLayout(LayoutKind.Sequential)] struct Header{public IntPtr data;public uint length,recorded;public UIntPtr user;public uint flags,loops;public IntPtr next;public UIntPtr reserved;}
  delegate void Callback(IntPtr h,uint msg,IntPtr instance,IntPtr p1,IntPtr p2);
  [DllImport("winmm.dll")] static extern int waveInOpen(out IntPtr h,uint id,ref Format f,Callback callback,IntPtr instance,uint flags);
  [DllImport("winmm.dll")] static extern int waveInPrepareHeader(IntPtr h,IntPtr header,uint size);
  [DllImport("winmm.dll")] static extern int waveInAddBuffer(IntPtr h,IntPtr header,uint size);
+ [StructLayout(LayoutKind.Sequential,CharSet=CharSet.Unicode)] struct Caps {public ushort manufacturer,product;public uint version;[MarshalAs(UnmanagedType.ByValTStr,SizeConst=32)]public string name;public uint formats;public ushort channels,reserved;}
+ [DllImport("winmm.dll")] static extern uint waveInGetNumDevs();
+ [DllImport("winmm.dll",CharSet=CharSet.Unicode)] static extern int waveInGetDevCapsW(UIntPtr id,out Caps caps,uint size);
+ public static List<MicDevice> Devices(){var result=new List<MicDevice>{new MicDevice(-1,"系统默认麦克风")};for(uint i=0;i<waveInGetNumDevs();i++){Caps caps;if(waveInGetDevCapsW((UIntPtr)i,out caps,(uint)Marshal.SizeOf(typeof(Caps)))==0)result.Add(new MicDevice((int)i,caps.name));}return result;}
+ public static int ResolveDevice(AppOptions o,List<MicDevice> devices){if(o.MicrophoneId<0)return -1;var match=devices.FirstOrDefault(d=>d.Id==o.MicrophoneId&&d.Name==o.MicrophoneName)??devices.FirstOrDefault(d=>d.Id>=0&&d.Name==o.MicrophoneName);if(match==null)throw new Exception("所选麦克风已断开，请在设置中重新选择设备。");return match.Id;}
+ public static int Level(byte[] bytes){double sum=0;int n=bytes.Length/2;if(n==0)return 0;for(int i=0;i+1<bytes.Length;i+=2){double v=(short)(bytes[i]|bytes[i+1]<<8)/32768.0;sum+=v*v;}double db=20*Math.Log10(Math.Sqrt(sum/n)+1e-9);return Math.Max(0,Math.Min(100,(int)((db+60)*100/60)));}
+ int device=-1;
+ public Recorder(Action<byte[]> consume,int device):this(consume){this.device=device;}
  [DllImport("winmm.dll")] static extern int waveInStart(IntPtr h);
  [DllImport("winmm.dll")] static extern int waveInReset(IntPtr h);
  [DllImport("winmm.dll")] static extern int waveInUnprepareHeader(IntPtr h,IntPtr header,uint size);
@@ -66,7 +85,7 @@ class Recorder : IDisposable {
  IntPtr handle;Callback callback;Action<byte[]> consume;List<IntPtr> headers=new List<IntPtr>();volatile bool closing;uint size=(uint)Marshal.SizeOf(typeof(Header));
  public Recorder(Action<byte[]> consume){this.consume=consume;callback=OnData;}
  static void Check(int code){if(code!=0)throw new Exception("麦克风错误 "+code+"，请检查默认录音设备及麦克风权限。");}
- public void Start(){var f=new Format{tag=1,channels=1,rate=16000,bytes=32000,align=2,bits=16};Check(waveInOpen(out handle,0xffffffff,ref f,callback,IntPtr.Zero,0x30000));try{for(int i=0;i<8;i++){var h=new Header{data=Marshal.AllocHGlobal(1280),length=1280};IntPtr p=Marshal.AllocHGlobal((int)size);Marshal.StructureToPtr(h,p,false);headers.Add(p);Check(waveInPrepareHeader(handle,p,size));Check(waveInAddBuffer(handle,p,size));}Check(waveInStart(handle));}catch{Dispose();throw;}}
+ public void Start(){var f=new Format{tag=1,channels=1,rate=16000,bytes=32000,align=2,bits=16};Check(waveInOpen(out handle,unchecked((uint)device),ref f,callback,IntPtr.Zero,0x30000));try{for(int i=0;i<8;i++){var h=new Header{data=Marshal.AllocHGlobal(1280),length=1280};IntPtr p=Marshal.AllocHGlobal((int)size);Marshal.StructureToPtr(h,p,false);headers.Add(p);Check(waveInPrepareHeader(handle,p,size));Check(waveInAddBuffer(handle,p,size));}Check(waveInStart(handle));}catch{Dispose();throw;}}
  void OnData(IntPtr h,uint msg,IntPtr instance,IntPtr p1,IntPtr p2){if(msg!=0x3c0)return;try{var head=(Header)Marshal.PtrToStructure(p1,typeof(Header));if(head.recorded>0){var bytes=new byte[head.recorded];Marshal.Copy(head.data,bytes,0,bytes.Length);consume(bytes);}if(!closing)waveInAddBuffer(handle,p1,size);}catch{closing=true;}}
  public void Dispose(){if(handle==IntPtr.Zero)return;closing=true;waveInReset(handle);foreach(var p in headers){waveInUnprepareHeader(handle,p,size);var h=(Header)Marshal.PtrToStructure(p,typeof(Header));Marshal.FreeHGlobal(h.data);Marshal.FreeHGlobal(p);}headers.Clear();waveInClose(handle);handle=IntPtr.Zero;GC.KeepAlive(callback);}
 }
@@ -83,7 +102,7 @@ static class Native {
  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
 }
 static class SelfTest {
- public static void Run(){FeatureTests.Run();if(Marshal.SizeOf(typeof(Native.Input))!=40)throw new Exception("x64 INPUT layout failed");var typed=Native.TextInputs("中A😀\r\n\t");if(typed.Length!=12||typed[0].data.keyboard.scan!='中'||typed[0].data.keyboard.flags!=4||typed[1].data.keyboard.flags!=6||typed[8].data.keyboard.key!=13||typed[10].data.keyboard.key!=9)throw new Exception("Unicode input test failed");var j=new JavaScriptSerializer();var s=new SortedDictionary<int,string>();Session.Apply(s,j.Deserialize<Dictionary<string,object>>("{\"sn\":0,\"ws\":[{\"cw\":[{\"w\":\"你\"}]}]}"));Session.Apply(s,j.Deserialize<Dictionary<string,object>>("{\"sn\":1,\"pgs\":\"rpl\",\"rg\":[0,0],\"ws\":[{\"cw\":[{\"w\":\"你好。\"}]}]}"));if(string.Concat(s.Values)!="你好。")throw new Exception("Replacement test failed");var c=new Credentials{AppId="test",ApiKey="key",ApiSecret="secret"};string url=Session.Url(c,"Tue, 10 Jul 2019 07:35:43 GMT");if(!url.StartsWith("wss://iat-api.xfyun.cn/v2/iat?authorization="))throw new Exception("URL test failed");File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"self-test.txt"),"PASS: ASR parameter mapping (Mandarin/English/dialect), settings round-trip, geometry recovery, validation, microphone icon; Unicode input events (Chinese, ASCII, surrogate pair, newline, tab), x64 INPUT layout, dynamic replacement, WebSocket authentication URL\r\n");}
+ public static void Run(){FeatureTests.Run();if(Marshal.SizeOf(typeof(Native.Input))!=40)throw new Exception("x64 INPUT layout failed");var typed=Native.TextInputs("中A😀\r\n\t");if(typed.Length!=12||typed[0].data.keyboard.scan!='中'||typed[0].data.keyboard.flags!=4||typed[1].data.keyboard.flags!=6||typed[8].data.keyboard.key!=13||typed[10].data.keyboard.key!=9)throw new Exception("Unicode input test failed");var j=new JavaScriptSerializer();var s=new SortedDictionary<int,string>();Session.Apply(s,j.Deserialize<Dictionary<string,object>>("{\"sn\":0,\"ws\":[{\"cw\":[{\"w\":\"你\"}]}]}"));Session.Apply(s,j.Deserialize<Dictionary<string,object>>("{\"sn\":1,\"pgs\":\"rpl\",\"rg\":[0,0],\"ws\":[{\"cw\":[{\"w\":\"你好。\"}]}]}"));if(string.Concat(s.Values)!="你好。")throw new Exception("Replacement test failed");var c=new Credentials{AppId="test",ApiKey="key",ApiSecret="secret"};string url=Session.Url(c,"Tue, 10 Jul 2019 07:35:43 GMT");if(!url.StartsWith("wss://iat-api.xfyun.cn/v2/iat?authorization="))throw new Exception("URL test failed");File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"self-test.txt"),"PASS: 55s segmentation (1/55/110/125s), exact PCM ordering, ordered asynchronous finals, microphone selection/persistence/missing-device recovery and level meter; ASR parameter mapping (Mandarin/English/dialect), settings round-trip, geometry recovery, validation, microphone icon; Unicode input events (Chinese, ASCII, surrogate pair, newline, tab), x64 INPUT layout, dynamic replacement, WebSocket authentication URL\r\n");}
 }
 }
 

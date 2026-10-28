@@ -13,3 +13,6 @@ hotkey.json
 *.pcm
 *.mp3
 *.log
+
+stream-test.txt
+mic-test.txt

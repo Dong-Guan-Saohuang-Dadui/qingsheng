@@ -5,6 +5,7 @@ namespace XunfeiLite {
 static class FeatureTests {
  static void Assert(bool value,string message){if(!value)throw new Exception(message);}
  public static void Run(){
+  ContinuousTests.Run();
   var options=new AppOptions();options.Validate();var b=options.Business();Assert(b.ContainsKey("eos")&&!b.ContainsKey("vad_eos")&&Convert.ToInt32(b["eos"])==10000,"Silence parameter mapping failed");Assert(Convert.ToString(b["dwa"])=="wpgs","Mandarin correction failed");
   options.Punctuation=false;options.Numbers=false;options.Script="zh-hk";b=options.Business();Assert(Convert.ToInt32(b["ptt"])==0&&Convert.ToInt32(b["nunum"])==0&&Convert.ToString(b["rlang"])=="zh-hk","Chinese options mapping failed");
   options.Language="en_us";b=options.Business();Assert(!b.ContainsKey("dwa")&&!b.ContainsKey("ptt")&&!b.ContainsKey("rlang"),"English unsupported option filtering failed");
